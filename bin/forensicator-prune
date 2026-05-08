@@ -1,0 +1,438 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use 5.014;
+use FindBin;
+use lib "$FindBin::RealBin/../lib";
+
+use Forensicator qw(open_catalog get_volume default_hostname json_decode);
+use Getopt::Long qw(:config posix_default no_ignore_case);
+use File::Spec;
+
+my %opt = (
+    catalog     => undef,
+    plan        => undef,
+    apply       => 0,
+    keep_rule   => undef,
+    interactive => 1,
+    hostname    => default_hostname(),
+    file_level  => 0,
+    yes         => 0,
+);
+
+GetOptions(\%opt,
+    'catalog=s',
+    'plan=s',
+    'apply'         => \$opt{apply},
+    'keep-rule=s'   => \$opt{keep_rule},
+    'interactive!'  => \$opt{interactive},
+    'hostname=s',
+    'file-level'    => \$opt{file_level},
+    'yes|y'         => \$opt{yes},
+    'help|h' => \&usage,
+) or die "see --help\n";
+
+sub usage {
+    print <<'EOF';
+forensicator-prune: act on a dedupe plan to remove duplicates and update catalog
+
+Usage:
+  forensicator-prune --catalog FILE --plan FILE.json [--apply] [opts]
+
+Options:
+  --catalog FILE       Local SQLite catalog (this host's files)
+  --plan FILE          JSON output from forensicator-dedupe --format json
+  --apply              Actually delete files (default: dry-run, no changes)
+  --keep-rule RULE     Auto-pick keeper instead of prompting:
+                         first              -- pick the first listed member
+                         host=NAME          -- prefer members on host NAME
+                         volume=NAME        -- prefer members on volume NAME
+                         shortest-path      -- prefer the shortest path
+  --no-interactive     Skip groups without a rule match (don't prompt)
+  --file-level         For dir-level dups, prompt per-file instead of per-tree
+  --hostname NAME      Override hostname (default: short hostname)
+  --yes, -y            Skip the final confirmation when --apply is set
+
+Only files belonging to --hostname are eligible for deletion. Members on
+other hosts are shown for context but never touched. Catalog entries for
+deleted files are removed atomically.
+EOF
+    exit 0;
+}
+
+die "missing --catalog\n" unless $opt{catalog};
+die "missing --plan\n"    unless $opt{plan};
+
+my $dbh = open_catalog($opt{catalog});
+
+open my $pfh, '<:raw', $opt{plan} or die "$opt{plan}: $!\n";
+my $plan_str = do { local $/; <$pfh> };
+close $pfh;
+my $plan = json_decode($plan_str);
+die "plan does not look like a forensicator-dedupe document\n"
+    unless ref $plan eq 'HASH' && ($plan->{forensicator} // '') eq 'dedupe';
+
+our $LAST_RESPONSE = '';
+
+my @actions;
+my $skipped = 0;
+my $no_local = 0;
+
+for my $g (@{$plan->{duplicate_groups} // []}) {
+    my @local = grep { $_->{hostname} eq $opt{hostname} } @{$g->{members}};
+    unless (@local) { $no_local++; next; }
+
+    my @keepers;
+    if ($opt{keep_rule}) {
+        @keepers = pick_by_rule($g->{members}, $opt{keep_rule});
+    }
+
+    my ($keep, @delete);
+
+    if (@keepers == 1) {
+        $keep = $keepers[0];
+        @delete = grep { $_ != $keep && $_->{hostname} eq $opt{hostname} } @{$g->{members}};
+    } elsif ($opt{interactive}) {
+        ($keep, @delete) = prompt_group($g, $opt{hostname});
+        last if !defined $keep && !@delete && $LAST_RESPONSE eq 'q';
+        if (!defined $keep) { $skipped++; next; }
+    } else {
+        $skipped++; next;
+    }
+
+    if ($opt{file_level} && $g->{kind} eq 'dir') {
+        push @actions, expand_dir_group($g, $keep, \@delete, $dbh, $opt{hostname});
+    } else {
+        push @actions, {
+            group  => $g,
+            keep   => $keep,
+            delete => \@delete,
+        };
+    }
+}
+
+print STDERR "[prune] $no_local groups had no members on this host (skipped silently)\n"
+    if $no_local;
+print STDERR "[prune] $skipped groups skipped by user/rule\n" if $skipped;
+
+unless (@actions) {
+    print STDERR "[prune] nothing to do\n";
+    exit 0;
+}
+
+print STDERR "\n[prune] planned actions:\n";
+my $total_files = 0;
+my $total_bytes = 0;
+for my $a (@actions) {
+    my $g = $a->{group};
+    my $keep_key = key_of($a->{keep});
+    print STDERR "  KEEP   $keep_key\n";
+    if ($g->{kind} eq 'dir' && !$opt{file_level}) {
+        for my $d (@{$a->{delete}}) {
+            my $info = subtree_info($dbh, $opt{hostname}, $d->{volume}, $d->{path});
+            $total_files += $info->{count};
+            $total_bytes += $info->{bytes};
+            printf STDERR "  DELETE %s  (%d files, %s)\n",
+                key_of($d), $info->{count}, fmt_bytes($info->{bytes});
+        }
+    } else {
+        for my $d (@{$a->{delete}}) {
+            $total_files++;
+            $total_bytes += ($d->{size_each} // $g->{size_each} // 0);
+            printf STDERR "  DELETE %s  (%s)\n",
+                key_of($d), fmt_bytes($d->{size_each} // $g->{size_each} // 0);
+        }
+    }
+}
+printf STDERR "\n[prune] total: %d files, %s\n", $total_files, fmt_bytes($total_bytes);
+
+unless ($opt{apply}) {
+    print STDERR "[prune] DRY RUN -- pass --apply to actually delete\n";
+    exit 0;
+}
+
+unless ($opt{yes}) {
+    print STDERR "[prune] proceed with deletion? type 'yes' to continue: ";
+    my $r = <STDIN>;
+    chomp $r if defined $r;
+    unless (defined $r && $r eq 'yes') {
+        print STDERR "[prune] aborted\n";
+        exit 1;
+    }
+}
+
+my $deleted_files = 0;
+my $deleted_bytes = 0;
+my $errors        = 0;
+
+for my $a (@actions) {
+    my $g = $a->{group};
+    for my $d (@{$a->{delete}}) {
+        if ($g->{kind} eq 'dir' && !$opt{file_level}) {
+            my ($df, $db, $err) = delete_subtree($dbh, $opt{hostname}, $d->{volume}, $d->{path});
+            $deleted_files += $df;
+            $deleted_bytes += $db;
+            $errors        += $err;
+        } else {
+            my ($df, $db, $err) = delete_file_member($dbh, $opt{hostname}, $d);
+            $deleted_files += $df;
+            $deleted_bytes += $db;
+            $errors        += $err;
+        }
+    }
+}
+
+printf STDERR "[prune] DONE: %d files removed, %s freed, %d errors\n",
+    $deleted_files, fmt_bytes($deleted_bytes), $errors;
+
+exit($errors ? 2 : 0);
+
+# --- helpers ---
+
+sub key_of {
+    my $m = shift;
+    my $p = length($m->{path}) ? $m->{path} : '<root>';
+    return "$m->{hostname}:$m->{volume}:$p";
+}
+
+sub pick_by_rule {
+    my ($members, $rule) = @_;
+    my @local = @$members;
+    if ($rule eq 'first') {
+        return ($local[0]);
+    }
+    if ($rule =~ /^host=(.+)$/) {
+        my $h = $1;
+        my @match = grep { $_->{hostname} eq $h } @local;
+        return @match == 1 ? @match : ();
+    }
+    if ($rule =~ /^volume=(.+)$/) {
+        my $v = $1;
+        my @match = grep { $_->{volume} eq $v } @local;
+        return @match == 1 ? @match : ();
+    }
+    if ($rule eq 'shortest-path') {
+        my @sorted = sort { length($a->{path}) <=> length($b->{path}) } @local;
+        return ($sorted[0]) if @sorted;
+    }
+    return ();
+}
+
+sub prompt_group {
+    my ($g, $host) = @_;
+    print STDERR "\n=== ", uc($g->{kind}),
+        " duplicate, ", fmt_bytes($g->{size_each}),
+        ($g->{kind} eq 'dir' ? " (".$g->{file_count_each}." files each)" : ""),
+        " ===\n";
+    my $i = 0;
+    for my $m (@{$g->{members}}) {
+        $i++;
+        my @tags;
+        push @tags, 'LOCAL' if $m->{hostname} eq $host;
+        push @tags, 'covered' if $m->{covered_by_ancestor};
+        my $tag = @tags ? ' [' . join(',', @tags) . ']' : '';
+        printf STDERR "  %d. %s%s\n", $i, key_of($m), $tag;
+    }
+    print STDERR "Keep which? (number to keep / a=keep all (skip) / s=skip / q=quit): ";
+    my $resp = <STDIN>;
+    $LAST_RESPONSE = '';
+    return unless defined $resp;
+    chomp $resp;
+    $LAST_RESPONSE = $resp;
+    return if $resp eq 's' || $resp eq 'a' || $resp eq '';
+    return if $resp eq 'q';
+    if ($resp =~ /^\d+$/) {
+        my $idx = int($resp) - 1;
+        return if $idx < 0 || $idx >= scalar @{$g->{members}};
+        my $keep = $g->{members}[$idx];
+        my @del  = grep { $_ != $keep && $_->{hostname} eq $host } @{$g->{members}};
+        return ($keep, @del);
+    }
+    return;
+}
+
+sub subtree_info {
+    my ($dbh, $host, $volume, $path) = @_;
+    my $vol = get_volume($dbh, $host, $volume);
+    return { count => 0, bytes => 0 } unless $vol;
+    my ($c, $b) = $dbh->selectrow_array(<<'SQL',
+SELECT COUNT(*), COALESCE(SUM(size),0)
+FROM files
+WHERE volume_id = ?
+  AND (path_norm = ? OR path_norm LIKE ?)
+SQL
+        undef, $vol->{volume_id}, $path, length($path) ? "$path/%" : '%');
+    return { count => $c // 0, bytes => $b // 0 };
+}
+
+sub expand_dir_group {
+    my ($g, $keep, $delete, $dbh, $host) = @_;
+    my @actions;
+    my $keep_vol = get_volume($dbh, $keep->{hostname}, $keep->{volume});
+    return () unless $keep_vol;
+    my $keep_files = $dbh->selectall_arrayref(<<'SQL', { Slice => {} },
+SELECT file_id, path, path_norm, size, sha512
+FROM files
+WHERE volume_id = ?
+  AND (path_norm = ? OR path_norm LIKE ?)
+ORDER BY path_norm
+SQL
+        $keep_vol->{volume_id}, $keep->{path}, length($keep->{path}) ? "$keep->{path}/%" : '%');
+
+    for my $d (@$delete) {
+        my $vol = get_volume($dbh, $d->{hostname}, $d->{volume});
+        next unless $vol;
+        my $del_files = $dbh->selectall_arrayref(<<'SQL', { Slice => {} },
+SELECT file_id, path, path_norm, size, sha512
+FROM files
+WHERE volume_id = ?
+  AND (path_norm = ? OR path_norm LIKE ?)
+ORDER BY path_norm
+SQL
+            $vol->{volume_id}, $d->{path}, length($d->{path}) ? "$d->{path}/%" : '%');
+
+        my %by_rel;
+        my $base = length($keep->{path}) ? length($keep->{path}) + 1 : 0;
+        for my $kf (@$keep_files) {
+            my $rel = substr($kf->{path_norm}, $base);
+            $by_rel{$rel} = $kf;
+        }
+        my $dbase = length($d->{path}) ? length($d->{path}) + 1 : 0;
+        for my $df (@$del_files) {
+            my $rel = substr($df->{path_norm}, $dbase);
+            my $kf = $by_rel{$rel} or next;
+            push @actions, {
+                group  => { kind => 'file', size_each => $df->{size} },
+                keep   => {
+                    hostname => $keep->{hostname},
+                    volume   => $keep->{volume},
+                    path     => $kf->{path_norm},
+                    file_id  => $kf->{file_id},
+                },
+                delete => [{
+                    hostname  => $d->{hostname},
+                    volume    => $d->{volume},
+                    path      => $df->{path_norm},
+                    file_id   => $df->{file_id},
+                    size_each => $df->{size},
+                }],
+            };
+        }
+    }
+    return @actions;
+}
+
+sub delete_file_member {
+    my ($dbh, $host, $m) = @_;
+    return (0, 0, 0) unless $m->{hostname} eq $host;
+
+    my $vol = get_volume($dbh, $m->{hostname}, $m->{volume});
+    unless ($vol) {
+        warn "[prune] volume not in catalog: $m->{hostname}:$m->{volume}\n";
+        return (0, 0, 1);
+    }
+    my $mount = $vol->{mount_point};
+    unless ($mount) {
+        warn "[prune] no mount_point for $m->{hostname}:$m->{volume}; cannot locate file\n";
+        return (0, 0, 1);
+    }
+
+    my ($file_id, $orig_path, $size);
+    if ($m->{file_id}) {
+        ($file_id, $orig_path, $size) = $dbh->selectrow_array(
+            'SELECT file_id, path, size FROM files WHERE file_id = ?',
+            undef, $m->{file_id});
+    }
+    unless ($file_id) {
+        ($file_id, $orig_path, $size) = $dbh->selectrow_array(<<'SQL',
+SELECT file_id, path, size FROM files WHERE volume_id = ? AND path_norm = ?
+SQL
+            undef, $vol->{volume_id}, $m->{path});
+    }
+    unless ($file_id) {
+        warn "[prune] no catalog entry for ", key_of($m), "\n";
+        return (0, 0, 1);
+    }
+
+    my $abs = File::Spec->catfile($mount, $orig_path);
+    unless (-f $abs) {
+        warn "[prune] file already missing: $abs (removing catalog entry)\n";
+        $dbh->do('DELETE FROM files WHERE file_id = ?', undef, $file_id);
+        return (0, 0, 1);
+    }
+
+    my @st = stat $abs;
+    if (@st && $st[7] != $size) {
+        warn "[prune] size mismatch for $abs (catalog: $size, disk: $st[7]); skipping\n";
+        return (0, 0, 1);
+    }
+
+    if (unlink $abs) {
+        $dbh->do('DELETE FROM files WHERE file_id = ?', undef, $file_id);
+        return (1, $size, 0);
+    } else {
+        warn "[prune] unlink failed: $abs: $!\n";
+        return (0, 0, 1);
+    }
+}
+
+sub delete_subtree {
+    my ($dbh, $host, $volume, $path) = @_;
+    my $vol = get_volume($dbh, $host, $volume);
+    unless ($vol) {
+        warn "[prune] volume not in catalog: $host:$volume\n";
+        return (0, 0, 1);
+    }
+    my $mount = $vol->{mount_point};
+    unless ($mount) {
+        warn "[prune] no mount_point for $host:$volume; cannot delete subtree\n";
+        return (0, 0, 1);
+    }
+    my $rows = $dbh->selectall_arrayref(<<'SQL', { Slice => {} },
+SELECT file_id, path, path_norm, size FROM files
+WHERE volume_id = ? AND (path_norm = ? OR path_norm LIKE ?)
+ORDER BY length(path_norm) DESC
+SQL
+        $vol->{volume_id}, $path, length($path) ? "$path/%" : '%');
+
+    my ($df, $db, $err) = (0, 0, 0);
+    my %dirs_seen;
+    for my $r (@$rows) {
+        my $abs = File::Spec->catfile($mount, $r->{path});
+        if (-f $abs) {
+            if (unlink $abs) {
+                $df++;
+                $db += $r->{size};
+                $dbh->do('DELETE FROM files WHERE file_id = ?', undef, $r->{file_id});
+                my @parts = File::Spec->splitdir((File::Spec->splitpath($abs))[1]);
+                while (@parts) {
+                    my $d = File::Spec->catdir(@parts);
+                    $dirs_seen{$d} = 1;
+                    pop @parts;
+                }
+            } else {
+                warn "[prune] unlink failed: $abs: $!\n";
+                $err++;
+            }
+        } else {
+            warn "[prune] file missing: $abs (removing catalog entry)\n";
+            $dbh->do('DELETE FROM files WHERE file_id = ?', undef, $r->{file_id});
+            $err++;
+        }
+    }
+
+    for my $d (sort { length($b) <=> length($a) } keys %dirs_seen) {
+        next unless -d $d;
+        rmdir $d;
+    }
+
+    return ($df, $db, $err);
+}
+
+sub fmt_bytes {
+    my $b = shift // 0;
+    my @u = ('B', 'KB', 'MB', 'GB', 'TB', 'PB');
+    my $i = 0;
+    while ($b >= 1024 && $i < $#u) { $b /= 1024; $i++ }
+    return $i == 0 ? "$b $u[$i]" : sprintf("%.2f %s", $b, $u[$i]);
+}

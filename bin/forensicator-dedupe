@@ -1,0 +1,361 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use 5.014;
+use FindBin;
+use lib "$FindBin::RealBin/../lib";
+
+use Forensicator qw(open_catalog catalog_meta json_encode);
+use Getopt::Long qw(:config posix_default no_ignore_case);
+use Digest::SHA;
+use POSIX qw(strftime);
+
+my %opt = (
+    catalog  => undef,
+    format   => 'human',
+    output   => undef,
+    min_size => 0,
+);
+GetOptions(\%opt,
+    'catalog=s',
+    'format=s',
+    'output=s',
+    'min-size=i' => \$opt{min_size},
+    'help|h' => \&usage,
+) or die "see --help\n";
+
+sub usage {
+    print <<'EOF';
+forensicator-dedupe: find duplicate files and directory trees
+
+Usage:
+  forensicator-dedupe --catalog FILE [--format human|json] [--output FILE]
+
+Options:
+  --catalog FILE    SQLite catalog (from forensicator-scan/-merge)
+  --format FORMAT   "human" or "json" (default human)
+  --output FILE     Write to FILE (default stdout)
+  --min-size BYTES  Ignore single-file dups smaller than this (default 0)
+
+Output identifies duplicate sets, rolling up identical directory trees so
+that descendants of an already-reported duplicate dir are suppressed unless
+they appear in additional uncovered locations.
+EOF
+    exit 0;
+}
+
+die "missing --catalog\n" unless $opt{catalog};
+die "format must be 'human' or 'json'\n" unless $opt{format} =~ /^(human|json)$/;
+
+my $dbh = open_catalog($opt{catalog}, readonly => 1);
+
+my $files = $dbh->selectall_arrayref(<<'SQL', { Slice => {} });
+SELECT f.file_id, f.path, f.path_norm, f.size, f.sha512,
+       v.hostname, v.volume
+FROM files f
+JOIN volumes v ON v.volume_id = f.volume_id
+ORDER BY v.hostname, v.volume, f.path_norm
+SQL
+
+my %size_count;
+$size_count{$_->{size}}++ for @$files;
+
+my $missing_collisions = 0;
+my @missing_examples;
+for my $f (@$files) {
+    if (!$f->{sha512} && ($size_count{$f->{size}} // 0) > 1) {
+        $missing_collisions++;
+        push @missing_examples, "$f->{hostname}:$f->{volume}:$f->{path}"
+            if @missing_examples < 5;
+    }
+}
+
+my @warnings;
+if ($missing_collisions) {
+    push @warnings, "$missing_collisions files have size collisions but no SHA512 hash; "
+        . "run forensicator-scan --rehash on each host. Examples: "
+        . join(', ', @missing_examples);
+}
+
+my %trees;
+for my $f (@$files) {
+    my $vkey = "$f->{hostname}\0$f->{volume}";
+    my $tree = $trees{$vkey} //= make_dir('', $f->{hostname}, $f->{volume});
+    insert_file($tree, $f);
+}
+
+my @all_nodes;
+for my $tree (values %trees) {
+    walk_compute($tree, \@all_nodes);
+}
+
+my %groups;
+for my $n (@all_nodes) {
+    next if $n->{sig} =~ /^[UX]:/;
+    next if $n->{sig} eq 'D:empty';
+    push @{$groups{$n->{sig}}}, $n;
+}
+
+my @dup_groups;
+for my $sig (keys %groups) {
+    my $g = $groups{$sig};
+    next unless @$g > 1;
+    my $first = $g->[0];
+    if ($first->{kind} eq 'file') {
+        next if $first->{size} < $opt{min_size};
+    }
+    push @dup_groups, $g;
+}
+
+@dup_groups = sort {
+    depth($a->[0]) <=> depth($b->[0])
+    or
+    group_size($b) <=> group_size($a)
+} @dup_groups;
+
+my %covered;
+
+my @reported;
+for my $g (@dup_groups) {
+    my @members;
+    my $any_uncovered = 0;
+    for my $n (@$g) {
+        my $cov = is_covered($n, \%covered);
+        $any_uncovered = 1 unless $cov;
+        push @members, { node => $n, covered => $cov };
+    }
+    next unless $any_uncovered;
+
+    push @reported, {
+        sig     => $g->[0]{sig},
+        kind    => $g->[0]{kind},
+        size    => $g->[0]{kind} eq 'file' ? $g->[0]{size} : $g->[0]{size_total},
+        count   => $g->[0]{kind} eq 'file' ? 1 : $g->[0]{count},
+        members => \@members,
+    };
+    for my $m (@members) {
+        $covered{ node_key($m->{node}) } = 1;
+    }
+}
+
+@reported = sort {
+    $b->{size} <=> $a->{size}
+    or
+    $b->{count} <=> $a->{count}
+} @reported;
+
+my $out_fh;
+if ($opt{output}) {
+    open $out_fh, '>:raw', $opt{output} or die "$opt{output}: $!\n";
+} else {
+    $out_fh = \*STDOUT;
+}
+
+if ($opt{format} eq 'json') {
+    emit_json($out_fh, \@reported, \@warnings);
+} else {
+    emit_human($out_fh, \@reported, \@warnings);
+}
+close $out_fh if $opt{output};
+
+exit 0;
+
+# --- helpers ---
+
+sub make_dir {
+    my ($path, $hostname, $volume) = @_;
+    return {
+        kind     => 'dir',
+        path     => $path,
+        hostname => $hostname,
+        volume   => $volume,
+        dirs     => {},
+        files    => [],
+    };
+}
+
+sub insert_file {
+    my ($tree, $f) = @_;
+    my @parts = split m{/}, $f->{path_norm};
+    my $name  = pop @parts;
+    my $node  = $tree;
+    for my $p (@parts) {
+        next unless length $p;
+        my $sub_path = length $node->{path} ? "$node->{path}/$p" : $p;
+        $node = $node->{dirs}{$p} //= make_dir($sub_path, $f->{hostname}, $f->{volume});
+    }
+    my $fpath = length $node->{path} ? "$node->{path}/$name" : $name;
+    push @{$node->{files}}, {
+        kind      => 'file',
+        name      => $name,
+        path      => $fpath,
+        orig_path => $f->{path},
+        hostname  => $f->{hostname},
+        volume    => $f->{volume},
+        size      => $f->{size},
+        sha512    => $f->{sha512},
+        file_id   => $f->{file_id},
+    };
+}
+
+sub walk_compute {
+    my ($node, $all) = @_;
+    my @entries;
+    my $size_total = 0;
+    my $count = 0;
+    for my $f (@{$node->{files}}) {
+        my $sig;
+        if ($f->{sha512}) {
+            $sig = "F:$f->{sha512}";
+        } elsif (($size_count{$f->{size}} // 0) <= 1) {
+            $sig = "U:$f->{file_id}";
+        } else {
+            $sig = "X:$f->{file_id}";
+        }
+        $f->{sig} = $sig;
+        push @entries, [$f->{name}, $sig];
+        $size_total += $f->{size};
+        $count++;
+        push @$all, $f;
+    }
+    for my $name (sort keys %{$node->{dirs}}) {
+        my $d = $node->{dirs}{$name};
+        walk_compute($d, $all);
+        push @entries, [$name, $d->{sig}];
+        $size_total += $d->{size_total};
+        $count      += $d->{count};
+    }
+    $node->{size_total} = $size_total;
+    $node->{count}      = $count;
+
+    if (!@entries) {
+        $node->{sig} = 'D:empty';
+    } else {
+        my $sha = Digest::SHA->new(512);
+        for my $e (sort { $a->[0] cmp $b->[0] } @entries) {
+            $sha->add($e->[0], "\0", $e->[1], "\0");
+        }
+        $node->{sig} = 'D:' . $sha->hexdigest;
+    }
+    push @$all, $node;
+}
+
+sub depth {
+    my $n = shift;
+    return 0 if !length $n->{path};
+    return ($n->{path} =~ tr{/}{}) + 1;
+}
+
+sub group_size {
+    my $g = shift;
+    my $n = $g->[0];
+    return $n->{kind} eq 'file' ? $n->{size} : $n->{size_total};
+}
+
+sub node_key {
+    my $n = shift;
+    return join("\0", $n->{hostname}, $n->{volume}, $n->{path});
+}
+
+sub is_covered {
+    my ($n, $covered) = @_;
+    my $hv = "$n->{hostname}\0$n->{volume}\0";
+    my $p  = $n->{path};
+    while ($p =~ s{/[^/]+$}{}) {
+        return 1 if $covered->{$hv . $p};
+    }
+    return 1 if $covered->{$hv};
+    return 0;
+}
+
+sub key_str {
+    my $n = shift;
+    my $p = length $n->{path} ? $n->{path} : '<root>';
+    return "$n->{hostname}:$n->{volume}:$p";
+}
+
+sub fmt_bytes {
+    my $b = shift // 0;
+    my @u = ('B', 'KB', 'MB', 'GB', 'TB', 'PB');
+    my $i = 0;
+    while ($b >= 1024 && $i < $#u) { $b /= 1024; $i++ }
+    return $i == 0 ? "$b $u[$i]" : sprintf("%.2f %s", $b, $u[$i]);
+}
+
+sub emit_human {
+    my ($fh, $reported, $warnings) = @_;
+    my $now = strftime('%Y-%m-%d %H:%M:%S %Z', localtime);
+    print {$fh} "# forensicator-dedupe report ($now)\n";
+    print {$fh} "# catalog: $opt{catalog}\n";
+    if (my $name = catalog_meta($dbh, 'dataset_name')) {
+        print {$fh} "# dataset: $name\n";
+    }
+    print {$fh} "# duplicate groups: ", scalar(@$reported), "\n";
+    if (@$warnings) {
+        print {$fh} "\n";
+        print {$fh} "WARNING: $_\n" for @$warnings;
+    }
+    print {$fh} "\n";
+
+    my $i = 0;
+    for my $g (@$reported) {
+        $i++;
+        my $kind  = uc $g->{kind};
+        my $size  = fmt_bytes($g->{size});
+        my $count = $g->{count};
+        my $head  = $g->{kind} eq 'file'
+            ? sprintf("[%d] %s  %s  %d copies", $i, $kind, $size, scalar @{$g->{members}})
+            : sprintf("[%d] %s  %s  (%d files each)  %d copies",
+                $i, $kind, $size, $count, scalar @{$g->{members}});
+        print {$fh} "$head\n";
+        my $first = 1;
+        for my $m (@{$g->{members}}) {
+            my $tag = $first ? 'KEEP-CANDIDATE:' : 'DUPLICATE:     ';
+            $first = 0;
+            my $note = $m->{covered} ? '   (covered by ancestor dup)' : '';
+            print {$fh} "  $tag ", key_str($m->{node}), "$note\n";
+        }
+        print {$fh} "\n";
+    }
+}
+
+sub emit_json {
+    my ($fh, $reported, $warnings) = @_;
+    my @groups;
+    for my $g (@$reported) {
+        my @mems;
+        for my $m (@{$g->{members}}) {
+            my $n = $m->{node};
+            my %entry = (
+                hostname            => $n->{hostname},
+                volume              => $n->{volume},
+                path                => $n->{path},
+                key                 => key_str($n),
+                covered_by_ancestor => $m->{covered} ? JSON::PP::true : JSON::PP::false,
+            );
+            if ($n->{kind} eq 'file') {
+                $entry{file_id}   = $n->{file_id};
+                $entry{sha512}    = $n->{sha512};
+                $entry{orig_path} = $n->{orig_path};
+            }
+            push @mems, \%entry;
+        }
+        push @groups, {
+            sig             => $g->{sig},
+            kind            => $g->{kind},
+            size_each       => $g->{size},
+            file_count_each => $g->{count},
+            members         => \@mems,
+        };
+    }
+    my $doc = {
+        forensicator       => 'dedupe',
+        version            => 1,
+        generated_at       => time,
+        catalog            => $opt{catalog},
+        dataset            => catalog_meta($dbh, 'dataset_name'),
+        warnings           => $warnings,
+        duplicate_groups   => \@groups,
+    };
+    print {$fh} json_encode($doc), "\n";
+}
