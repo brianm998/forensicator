@@ -156,6 +156,52 @@ By default scan only hashes files whose size collides with another file's
 size — much faster on multi-TB archives, with the same dedupe results.
 Use `--full-hash` to hash every file.
 
+## Where to put the catalog
+
+**The catalog must live on a filesystem with working POSIX locking** —
+APFS, ext4, NTFS, HFS+, etc. SMB, NFS, exFAT, and some FUSE mounts have
+broken or absent fcntl locking, and forensicator will refuse to run on
+them. Long-running SQLite writes on those filesystems silently corrupt
+the database (`database disk image is malformed`).
+
+The catalog stores `mount_point` separately from the SQLite file's
+location, so the SQLite catalog can live on your local SSD even when the
+data being cataloged is on an external/networked volume. That's the
+recommended setup.
+
+If you really need the catalog to follow the data on a removable drive,
+format the drive APFS (macOS) or ext4 (Linux). exFAT will not work.
+
+## Hashlog and recovery
+
+Every file written to the catalog is also appended to a plain-text JSONL
+hashlog **before** the SQLite write, with autoflush enabled. Default
+path is `<catalog>.hashlog.jsonl`; override with `--hashlog FILE`. Use
+`--no-hashlog` to disable.
+
+If the SQLite catalog ever corrupts mid-scan, you can recover without
+re-walking the volume:
+
+```
+# 1. Salvage what's still readable from the corrupt catalog.
+cp /path/to/corrupt.sqlite /tmp/corrupt.sqlite
+sqlite3 /tmp/corrupt.sqlite ".recover" > /tmp/recover.sql
+sqlite3 ~/recovered.sqlite < /tmp/recover.sql
+
+# 2. Replay the hashlog on top to fill in anything the recover missed.
+forensicator-merge --output ~/recovered.sqlite --inputs ~/recovered.sqlite.hashlog.jsonl
+# (merge takes the latest scanned_at, so re-applying old records is safe)
+
+# 3. Or, if .recover fails entirely, rebuild from the hashlog alone:
+forensicator-merge --output ~/rebuilt.sqlite --inputs ~/recovered.sqlite.hashlog.jsonl
+```
+
+By default the hashlog sits next to the catalog. Since the catalog
+itself must be on a reliable local filesystem (see above), the default
+is fine for most uses. Override with `--hashlog FILE` if you want to
+keep the recovery log somewhere else (e.g., on a different physical
+disk for extra durability).
+
 ## Cross-machine workflow
 
 Each machine maintains its own SQLite catalog. The merge phase produces a
@@ -216,6 +262,8 @@ forensicator-scan --catalog FILE --rehash-list FILE --volume NAME --root DIR
 | `--rehash-list FILE` | Hash specific files listed in a merge-produced JSONL |
 | `--dataset NAME` | Dataset label, stored in catalog metadata |
 | `--quiet` | Suppress progress output |
+| `--hashlog FILE` | Append-only JSONL recovery log; default `<catalog>.hashlog.jsonl` |
+| `--no-hashlog` | Disable the hashlog (lose recovery insurance) |
 
 ### `forensicator-dedupe`
 

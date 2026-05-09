@@ -9,7 +9,7 @@ use Forensicator qw(
     open_catalog upsert_volume get_volume
     normalize_path sha512_file
     default_hostname os_name
-    jsonl_reader
+    jsonl_reader json_encode
 );
 use Getopt::Long qw(:config posix_default no_ignore_case);
 use File::Find ();
@@ -28,6 +28,8 @@ my %opt = (
     progress_every => 1000,
     commit_every   => 500,
     quiet          => 0,
+    hashlog        => undef,
+    no_hashlog     => 0,
 );
 
 GetOptions(\%opt,
@@ -43,6 +45,8 @@ GetOptions(\%opt,
     'progress-every=i' => \$opt{progress_every},
     'commit-every=i'   => \$opt{commit_every},
     'quiet|q'          => \$opt{quiet},
+    'hashlog=s'        => \$opt{hashlog},
+    'no-hashlog'       => \$opt{no_hashlog},
     'help|h'           => \&usage,
 ) or die "see --help\n";
 
@@ -68,25 +72,66 @@ Options:
   --progress-every N    Log progress every N files (default 1000)
   --commit-every N      Commit DB transaction every N files (default 500)
   --quiet               Suppress progress output
+  --hashlog FILE        Append-only JSONL recovery log. Each file written to
+                        SQLite is also appended here BEFORE the SQLite write
+                        is issued, with autoflush. If SQLite ever corrupts,
+                        this log can be replayed via:
+                          forensicator-merge --inputs HASHLOG --output NEW.sqlite
+                        Default: <catalog>.hashlog.jsonl
+  --no-hashlog          Disable the hashlog (lose recovery insurance).
+
+NOTE: --catalog must live on a filesystem with working POSIX locking
+(APFS, ext4, NTFS, HFS+). SMB / NFS / exFAT / some FUSE mounts will be
+rejected at startup. The catalog records mount_point separately, so it
+can find files on the original data volume regardless of where the
+SQLite file lives.
 EOF
     exit 0;
 }
 
+die "unexpected positional argument(s): @ARGV\nrun with --help for usage\n" if @ARGV;
 die "missing --catalog\n" unless $opt{catalog};
 
-my $dbh = open_catalog($opt{catalog}, dataset => $opt{dataset});
-
 if ($opt{rehash} || $opt{rehash_list}) {
-    do_rehash(\%opt, $dbh);
+    die "rehash needs --volume\n" unless $opt{volume};
+    die "rehash needs --root\n"   unless $opt{root};
+    die "root not a directory: $opt{root}\n" unless -d $opt{root};
 } else {
     die "missing --volume\n" unless $opt{volume};
     die "missing --root\n"   unless $opt{root};
     die "root not a directory: $opt{root}\n" unless -d $opt{root};
+}
+
+my $dbh = open_catalog($opt{catalog}, dataset => $opt{dataset});
+
+our $HASHLOG_FH;
+$HASHLOG_FH = open_hashlog(\%opt, $dbh);
+
+if ($opt{rehash} || $opt{rehash_list}) {
+    do_rehash(\%opt, $dbh);
+} else {
     do_scan(\%opt, $dbh);
 }
 
+close $HASHLOG_FH if $HASHLOG_FH;
 $dbh->disconnect;
 exit 0;
+
+sub open_hashlog {
+    my ($opt, $dbh) = @_;
+    return undef if $opt->{no_hashlog};
+    my $path = $opt->{hashlog} // ($opt->{catalog} . '.hashlog.jsonl');
+    open my $fh, '>>:raw', $path or die "hashlog $path: $!\n";
+    my $oldfh = select($fh); $| = 1; select($oldfh);
+    warn "[scan] hashlog: $path\n" unless $opt->{quiet};
+    return $fh;
+}
+
+sub log_record {
+    my ($fh, $rec) = @_;
+    return unless $fh;
+    print {$fh} json_encode($rec), "\n";
+}
 
 # --- skip lists ---
 
@@ -193,6 +238,18 @@ SQL
             }
         }
 
+        log_record($HASHLOG_FH, {
+            hostname    => $opt->{hostname},
+            volume      => $opt->{volume},
+            mount_point => $mount,
+            os          => os_name(),
+            path        => $rel,
+            path_norm   => $norm,
+            size        => $size + 0,
+            mtime       => $mtime + 0,
+            sha512      => $sha,
+            scanned_at  => time,
+        });
         $ins->execute($vid, $rel, $norm, $size, $mtime, $sha, time);
 
         $count++;
@@ -201,9 +258,15 @@ SQL
             $dbh->begin_work;
         }
         if ($count % $opt->{progress_every} == 0) {
-            my $el = time - $started;
-            log_progress($opt, sprintf("%d files, %d hashed, %d skipped, %d errors, %ds",
-                $count, $hashed, $skipped, $errors, $el));
+            my $el = time - $started || 1;
+            my $rate = $count / $el;
+            if ($opt->{full_hash}) {
+                log_progress($opt, sprintf("walk: %d files, %d hashed, %d skipped, %d errors, %s elapsed (%.0f/s)",
+                    $count, $hashed, $skipped, $errors, fmt_dur($el), $rate));
+            } else {
+                log_progress($opt, sprintf("walk: %d files cataloged, %d skipped, %d errors, %s elapsed (%.0f/s) -- hashing happens after walk",
+                    $count, $skipped, $errors, fmt_dur($el), $rate));
+            }
         }
     };
 
@@ -215,13 +278,13 @@ SQL
 
     $dbh->commit;
 
-    log_progress($opt, sprintf("walk done: %d files, %d hashed, %d skipped, %d errors, %ds",
+    log_progress($opt, sprintf("walk done: %d files cataloged, %d hashed, %d skipped, %d errors, %ds",
         $count, $hashed, $skipped, $errors, time - $started));
 
     if (!$opt->{full_hash}) {
-        log_progress($opt, "hashing size-collision files across all reachable volumes...");
         my $rows = $dbh->selectall_arrayref(<<'SQL', { Slice => {} });
-SELECT f.file_id, f.path, f.size, v.mount_point, v.hostname, v.volume
+SELECT f.file_id, f.path, f.path_norm, f.size, f.mtime,
+       v.mount_point, v.hostname, v.volume, v.os
 FROM files f
 JOIN volumes v ON v.volume_id = f.volume_id
 WHERE f.sha512 IS NULL
@@ -229,12 +292,19 @@ WHERE f.sha512 IS NULL
     SELECT size FROM files GROUP BY size HAVING COUNT(*) > 1
   )
 SQL
+        my $total = scalar @$rows;
+        my $total_bytes = 0;
+        $total_bytes += $_->{size} for @$rows;
+        log_progress($opt, sprintf("hashing %d size-collision files (%s) across all reachable volumes...",
+            $total, fmt_bytes($total_bytes)));
         my $upd = $dbh->prepare('UPDATE files SET sha512 = ? WHERE file_id = ?');
         my $i = 0;
         my $local_hashed = 0;
         my $unreachable = 0;
+        my $hash_started = time;
         $dbh->begin_work;
         for my $r (@$rows) {
+            $i++;
             unless ($r->{mount_point} && -d $r->{mount_point}) {
                 $unreachable++;
                 next;
@@ -243,19 +313,31 @@ SQL
             unless (-f $abs) { $unreachable++; next; }
             my $sha = sha512_file($abs);
             unless ($sha) { $errors++; next; }
+            log_record($HASHLOG_FH, {
+                hostname    => $r->{hostname},
+                volume      => $r->{volume},
+                mount_point => $r->{mount_point},
+                os          => $r->{os},
+                path        => $r->{path},
+                path_norm   => $r->{path_norm},
+                size        => $r->{size} + 0,
+                mtime       => ($r->{mtime} // 0) + 0,
+                sha512      => $sha,
+                scanned_at  => time,
+            });
             $upd->execute($sha, $r->{file_id});
             $local_hashed++;
-            $i++;
             if ($i % $opt->{commit_every} == 0) {
                 $dbh->commit; $dbh->begin_work;
             }
             if ($i % $opt->{progress_every} == 0) {
-                log_progress($opt, "$i collision-hashes done");
+                log_progress($opt, fmt_eta('collision-hashes', $i, $total, $hash_started));
             }
         }
         $dbh->commit;
         $hashed += $local_hashed;
-        log_progress($opt, "collision-hash done: $local_hashed hashed, $unreachable unreachable");
+        log_progress($opt, sprintf("collision-hash done: %d hashed, %d unreachable, %s",
+            $local_hashed, $unreachable, fmt_dur(time - $hash_started)));
     }
 
     log_progress($opt, sprintf("FINAL: %d files, %d hashed, %d skipped, %d errors, %ds",
@@ -264,10 +346,6 @@ SQL
 
 sub do_rehash {
     my ($opt, $dbh) = @_;
-
-    die "rehash needs --volume\n" unless $opt->{volume};
-    die "rehash needs --root\n"   unless $opt->{root};
-    die "root not a directory: $opt->{root}\n" unless -d $opt->{root};
 
     my $vol = get_volume($dbh, $opt->{hostname}, $opt->{volume});
     die "volume not in catalog: $opt->{hostname}:$opt->{volume}\n" unless $vol;
@@ -281,7 +359,7 @@ sub do_rehash {
     if ($opt->{rehash_list}) {
         my $reader = jsonl_reader($opt->{rehash_list});
         my $sel = $dbh->prepare(<<'SQL');
-SELECT file_id, path, size FROM files WHERE volume_id = ? AND path_norm = ? AND sha512 IS NULL
+SELECT file_id, path, path_norm, size, mtime FROM files WHERE volume_id = ? AND path_norm = ? AND sha512 IS NULL
 SQL
         while (my $task = $reader->()) {
             next unless ref $task eq 'HASH' && %$task;
@@ -295,17 +373,21 @@ SQL
         }
     } else {
         @rows = @{$dbh->selectall_arrayref(<<'SQL', { Slice => {} }, $vol->{volume_id})};
-SELECT file_id, path, size FROM files WHERE volume_id = ? AND sha512 IS NULL
+SELECT file_id, path, path_norm, size, mtime FROM files WHERE volume_id = ? AND sha512 IS NULL
 SQL
     }
 
-    log_progress($opt, scalar(@rows) . " files to rehash");
+    my $total = scalar @rows;
+    my $total_bytes = 0;
+    $total_bytes += $_->{size} for @rows;
+    log_progress($opt, sprintf("%d files to rehash (%s)", $total, fmt_bytes($total_bytes)));
 
     my $upd = $dbh->prepare('UPDATE files SET sha512 = ? WHERE file_id = ?');
     my ($i, $hashed, $errors) = (0, 0, 0);
     my $started = time;
     $dbh->begin_work;
     for my $r (@rows) {
+        $i++;
         my $abs = File::Spec->catfile($opt->{root}, $r->{path});
         unless (-f $abs) {
             warn "[rehash] missing: $abs\n" unless $opt->{quiet};
@@ -314,18 +396,57 @@ SQL
         }
         my $sha = sha512_file($abs);
         unless ($sha) { $errors++; next; }
+        log_record($HASHLOG_FH, {
+            hostname    => $opt->{hostname},
+            volume      => $opt->{volume},
+            mount_point => $opt->{root},
+            os          => os_name(),
+            path        => $r->{path},
+            path_norm   => $r->{path_norm},
+            size        => $r->{size} + 0,
+            mtime       => ($r->{mtime} // 0) + 0,
+            sha512      => $sha,
+            scanned_at  => time,
+        });
         $upd->execute($sha, $r->{file_id});
         $hashed++;
-        $i++;
         if ($i % $opt->{commit_every} == 0) {
             $dbh->commit; $dbh->begin_work;
         }
         if ($i % $opt->{progress_every} == 0) {
-            log_progress($opt, sprintf("%d/%d hashed, %ds", $i, scalar @rows, time - $started));
+            log_progress($opt, fmt_eta('rehash', $i, $total, $started));
         }
     }
     $dbh->commit;
 
-    log_progress($opt, sprintf("rehash done: %d hashed, %d errors, %ds",
-        $hashed, $errors, time - $started));
+    log_progress($opt, sprintf("rehash done: %d hashed, %d errors, %s",
+        $hashed, $errors, fmt_dur(time - $started)));
+}
+
+sub fmt_dur {
+    my $s = int(shift // 0);
+    return sprintf("%ds", $s) if $s < 60;
+    my $h = int($s / 3600);
+    my $m = int(($s % 3600) / 60);
+    my $sec = $s % 60;
+    return sprintf("%dh%02dm", $h, $m) if $h;
+    return sprintf("%dm%02ds", $m, $sec);
+}
+
+sub fmt_bytes {
+    my $b = shift // 0;
+    my @u = ('B', 'KB', 'MB', 'GB', 'TB', 'PB');
+    my $i = 0;
+    while ($b >= 1024 && $i < $#u) { $b /= 1024; $i++ }
+    return $i == 0 ? "$b $u[$i]" : sprintf("%.2f %s", $b, $u[$i]);
+}
+
+sub fmt_eta {
+    my ($label, $i, $total, $started) = @_;
+    my $el = time - $started || 1;
+    my $rate = $i / $el;
+    my $pct = $total ? ($i / $total * 100) : 0;
+    my $eta_s = ($rate > 0 && $i < $total) ? (($total - $i) / $rate) : 0;
+    return sprintf("%s: %d / %d done (%.1f%%, %.0f/s, %s elapsed, ETA %s)",
+        $label, $i, $total, $pct, $rate, fmt_dur($el), fmt_dur($eta_s));
 }

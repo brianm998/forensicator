@@ -58,21 +58,51 @@ sub sha512_file {
 
 sub open_catalog {
     my ($path, %opts) = @_;
-    my $exists = -e $path;
     my $dbh = DBI->connect("dbi:SQLite:dbname=$path", '', '', {
         RaiseError     => 1,
         PrintError     => 0,
         AutoCommit     => 1,
         sqlite_unicode => 1,
     });
-    $dbh->do('PRAGMA journal_mode = WAL')   unless $opts{readonly};
-    $dbh->do('PRAGMA synchronous = NORMAL') unless $opts{readonly};
-    $dbh->do('PRAGMA foreign_keys = ON');
-    $dbh->do('PRAGMA cache_size = -200000'); # ~200MB cache
-    init_catalog($dbh, %opts) unless $exists;
-    my $sv = catalog_meta($dbh, 'schema_version') // 0;
-    die "catalog $path has schema version $sv, expected " . SCHEMA_VERSION . "\n"
-        if $sv != SCHEMA_VERSION;
+    unless ($opts{readonly}) {
+        eval { $dbh->do('PRAGMA journal_mode = WAL'); 1 }
+            or warn "[forensicator] WAL journal mode unavailable on this filesystem ($path); using rollback journal\n";
+        eval { $dbh->do('PRAGMA synchronous = NORMAL'); 1 };
+    }
+    eval { $dbh->do('PRAGMA foreign_keys = ON'); 1 };
+    eval { $dbh->do('PRAGMA cache_size = -200000'); 1 };
+
+    my $ok = eval {
+        my $has_meta = $dbh->selectrow_array(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='meta'"
+        );
+        if ($has_meta) {
+            my $sv = catalog_meta($dbh, 'schema_version') // 0;
+            die "catalog $path has schema version $sv, expected " . SCHEMA_VERSION . "\n"
+                if $sv != SCHEMA_VERSION;
+        }
+        init_catalog($dbh, %opts) unless $opts{readonly};
+        1;
+    };
+    unless ($ok) {
+        my $err = $@;
+        eval { $dbh->disconnect };
+        if ($err =~ /disk I\/O error|database is locked|locking protocol/i) {
+            die <<"MSG";
+cannot open catalog $path: $err
+This filesystem appears to have broken POSIX locking (SMB / NFS / exFAT /
+some FUSE mounts). forensicator refuses to operate on such filesystems
+because long-running scans corrupt SQLite there ("database disk image is
+malformed"), and the previous nolock fallback caused real data loss.
+
+Move the catalog to a local SSD/HDD with a normal filesystem (APFS / ext4
+/ NTFS / HFS+) and re-run. The catalog records mount_point separately so
+it can still find files on the original data volume, regardless of where
+the SQLite file lives.
+MSG
+        }
+        die "cannot open catalog $path: $err";
+    }
     return $dbh;
 }
 
