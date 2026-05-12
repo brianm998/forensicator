@@ -14,6 +14,17 @@ use Forensicator qw(
 use Getopt::Long qw(:config posix_default no_ignore_case);
 use File::Find ();
 use File::Spec ();
+use Encode ();
+
+# Skip lists need to be initialized BEFORE do_scan runs, so they live up
+# top here rather than near the helpers.
+my %SKIP_DIRS = map { $_ => 1 } (
+    '.git', '.Spotlight-V100', '.Trashes', '.fseventsd', '.TemporaryItems',
+    '$RECYCLE.BIN', 'System Volume Information', '.DocumentRevisions-V100',
+);
+my %SKIP_FILES = map { $_ => 1 } (
+    '.DS_Store', 'Thumbs.db', 'desktop.ini', '.localized',
+);
 
 my %opt = (
     catalog        => undef,
@@ -133,16 +144,6 @@ sub log_record {
     print {$fh} json_encode($rec), "\n";
 }
 
-# --- skip lists ---
-
-my %SKIP_DIRS = map { $_ => 1 } (
-    '.git', '.Spotlight-V100', '.Trashes', '.fseventsd', '.TemporaryItems',
-    '$RECYCLE.BIN', 'System Volume Information', '.DocumentRevisions-V100',
-);
-my %SKIP_FILES = map { $_ => 1 } (
-    '.DS_Store', 'Thumbs.db', 'desktop.ini', '.localized',
-);
-
 sub _basename {
     my $p = shift;
     $p =~ s{[/\\]+$}{};
@@ -212,6 +213,9 @@ SQL
         if ($size == 0) { $skipped++; return; }
 
         my $rel = File::Spec->abs2rel($abs, $opt->{root});
+        # File::Find returns filesystem bytes. Decode as UTF-8 so sqlite_unicode
+        # doesn't double-encode. Fall back to as-is if it's not valid UTF-8.
+        $rel = eval { Encode::decode('UTF-8', $rel, Encode::FB_CROAK) } // $rel;
         my $norm = normalize_path($rel);
 
         $sel->execute($vid, $norm);

@@ -1,0 +1,14 @@
+build/
+build-*/
+dist/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+forensicator
+forensicator.exe
+.cache/
+compile_commands.json
+.vscode/

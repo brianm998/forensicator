@@ -8,6 +8,9 @@ use Digest::SHA;
 use Sys::Hostname ();
 use JSON::PP ();
 use Exporter 'import';
+use File::Spec ();
+use File::Basename ();
+use Cwd ();
 
 our $VERSION = '0.01';
 use constant SCHEMA_VERSION => 1;
@@ -106,45 +109,52 @@ MSG
     return $dbh;
 }
 
+sub _find_schema_file {
+    # perl/lib/Forensicator.pm -> ../../schema/forensicator.sql
+    my $mod_path = Cwd::abs_path(__FILE__);
+    my $lib_dir  = File::Basename::dirname($mod_path);
+    my $perl_dir = File::Basename::dirname($lib_dir);
+    my $root_dir = File::Basename::dirname($perl_dir);
+    my $sql      = File::Spec->catfile($root_dir, 'schema', 'forensicator.sql');
+    return $sql if -f $sql;
+    # Fallback: schema/ alongside lib/ (for installed layout)
+    my $alt = File::Spec->catfile($perl_dir, 'schema', 'forensicator.sql');
+    return $alt if -f $alt;
+    # Env override for unusual layouts
+    if (my $env = $ENV{FORENSICATOR_SCHEMA}) {
+        return $env if -f $env;
+    }
+    die "cannot locate schema/forensicator.sql (tried $sql)\n";
+}
+
+sub schema_sql {
+    my $path = _find_schema_file();
+    open my $fh, '<:raw', $path or die "schema file $path: $!\n";
+    local $/;
+    my $sql = <$fh>;
+    close $fh;
+    return $sql;
+}
+
 sub init_catalog {
     my ($dbh, %opts) = @_;
-    $dbh->do(<<'SQL');
-CREATE TABLE IF NOT EXISTS meta (
-  key   TEXT PRIMARY KEY,
-  value TEXT
-)
-SQL
-    $dbh->do(<<'SQL');
-CREATE TABLE IF NOT EXISTS volumes (
-  volume_id   INTEGER PRIMARY KEY AUTOINCREMENT,
-  hostname    TEXT NOT NULL,
-  volume      TEXT NOT NULL,
-  mount_point TEXT,
-  os          TEXT,
-  scanned_at  INTEGER,
-  UNIQUE(hostname, volume)
-)
-SQL
-    $dbh->do(<<'SQL');
-CREATE TABLE IF NOT EXISTS files (
-  file_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-  volume_id  INTEGER NOT NULL REFERENCES volumes(volume_id) ON DELETE CASCADE,
-  path       TEXT NOT NULL,
-  path_norm  TEXT NOT NULL,
-  size       INTEGER NOT NULL,
-  mtime      INTEGER NOT NULL,
-  sha512     TEXT,
-  scanned_at INTEGER NOT NULL,
-  UNIQUE(volume_id, path_norm)
-)
-SQL
-    $dbh->do('CREATE INDEX IF NOT EXISTS idx_files_sha512 ON files(sha512) WHERE sha512 IS NOT NULL');
-    $dbh->do('CREATE INDEX IF NOT EXISTS idx_files_size   ON files(size)');
-    $dbh->do('CREATE INDEX IF NOT EXISTS idx_files_volume ON files(volume_id, path_norm)');
-
+    my $sql = schema_sql();
+    for my $stmt (_split_sql_statements($sql)) {
+        next unless $stmt =~ /\S/;
+        $dbh->do($stmt);
+    }
     set_catalog_meta($dbh, 'schema_version', SCHEMA_VERSION);
     set_catalog_meta($dbh, 'created_at', time);
     set_catalog_meta($dbh, 'dataset_name', $opts{dataset}) if defined $opts{dataset};
+}
+
+sub _split_sql_statements {
+    my $sql = shift;
+    # Strip line comments, split on semicolons. Schema is simple: no
+    # triggers/procedures with embedded semicolons.
+    $sql =~ s{--[^\n]*}{}g;
+    my @stmts = split /;\s*(?:\n|$)/, $sql;
+    return grep { /\S/ } @stmts;
 }
 
 sub catalog_meta {

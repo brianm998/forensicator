@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forensicator"
+version = "0.1.0"
+description = "Catalog and deduplicate large digital archives"
+requires-python = ">=3.10"
+authors = [{name = "forensicator authors"}]
+license = {text = "MIT"}
+readme = "README.md"
+
+[project.scripts]
+forensicator = "forensicator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["forensicator*"]

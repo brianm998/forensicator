@@ -4,3 +4,22 @@
 *.sqlite-shm
 *.jsonl
 local/
+
+# C++ build / release outputs
+cpp/build/
+cpp/build-*/
+cpp/dist/
+
+# Python build artifacts
+python/__pycache__/
+python/forensicator/__pycache__/
+python/forensicator.egg-info/
+python/.pytest_cache/
+python/build/
+python/dist/
+*.pyc
+
+# Editor
+.DS_Store
+.vscode/
+.idea/

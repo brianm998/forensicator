@@ -1,0 +1,54 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use 5.014;
+use FindBin;
+use File::Spec;
+
+my %SUBCOMMANDS = (
+    scan   => "$FindBin::RealBin/forensicator-scan",
+    dedupe => "$FindBin::RealBin/forensicator-dedupe",
+    prune  => "$FindBin::RealBin/forensicator-prune",
+    merge  => "$FindBin::RealBin/forensicator-merge",
+);
+
+sub usage {
+    my $exit = shift // 0;
+    my $fh = $exit ? \*STDERR : \*STDOUT;
+    print {$fh} <<'EOF';
+forensicator: catalog and deduplicate large digital archives
+
+Usage:
+  forensicator <command> [options...]
+
+Commands:
+  scan      Walk a volume and record files in a catalog
+  dedupe    Find duplicate files and directory trees
+  prune     Interactively remove duplicates and update the catalog
+  merge     Combine catalogs (sqlite/jsonl) and emit a rehash worklist
+
+Run any command with --help for its own options:
+  forensicator scan --help
+
+The legacy hyphenated forms (forensicator-scan, forensicator-dedupe, ...)
+remain available for compatibility.
+EOF
+    exit $exit;
+}
+
+usage(0) if !@ARGV || $ARGV[0] eq '--help' || $ARGV[0] eq '-h';
+
+my $cmd = shift @ARGV;
+my $target = $SUBCOMMANDS{$cmd};
+unless ($target) {
+    print STDERR "forensicator: unknown command '$cmd'\n\n";
+    usage(2);
+}
+
+unless (-x $target || -f $target) {
+    die "forensicator: cannot find subcommand executable: $target\n";
+}
+
+# exec preserves argv, stdin/out/err, exit code.
+exec { $target } $target, @ARGV
+    or die "forensicator: failed to exec $target: $!\n";
